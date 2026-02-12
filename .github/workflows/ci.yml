@@ -29,3 +29,32 @@ jobs:
         working-directory: build
         run: ctest --output-on-failure
 
+  build-armhf:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install armhf toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake make \
+            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+
+      - name: Configure (armhf)
+        run: |
+          cmake -S . -B build-armhf \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc \
+            -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++
+
+      - name: Build (armhf)
+        run: cmake --build build-armhf --config Release
+
+      - name: Upload armhf binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: megra_police_http_server-armhf
+          path: build-armhf/megra_police_http_server
+
