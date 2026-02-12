@@ -1,10 +1,14 @@
 #ifdef __linux__
 
 #include <arpa/inet.h>
+#include <cerrno>
+#include <csignal>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <netinet/in.h>
 #include <sstream>
 #include <string>
@@ -14,10 +18,61 @@
 #include <vector>
 
 namespace {
-const int SERVER_PORT = 1616;
-const std::size_t MAX_REQUEST_SIZE = 50 * 1024 * 1024; // 50 MB
-const int LISTEN_BACKLOG = 10;
+constexpr int SERVER_PORT = 1616;
+constexpr std::size_t MAX_REQUEST_SIZE = 50 * 1024 * 1024; // 50 MB
+constexpr int LISTEN_BACKLOG = 10;
+constexpr std::size_t READ_BUFFER_SIZE = 4096;
+constexpr int MAX_RETRIES = 3;
 } // anonymous namespace
+
+// RAII Socket wrapper
+class Socket {
+public:
+    explicit Socket(int fd = -1) : fd_(fd) {}
+    
+    ~Socket() {
+        if (fd_ != -1) {
+            ::close(fd_);
+        }
+    }
+    
+    Socket(const Socket&) = delete;
+    Socket& operator=(const Socket&) = delete;
+    
+    Socket(Socket&& other) noexcept : fd_(other.fd_) {
+        other.fd_ = -1;
+    }
+    
+    Socket& operator=(Socket&& other) noexcept {
+        if (this != &other) {
+            if (fd_ != -1) {
+                ::close(fd_);
+            }
+            fd_ = other.fd_;
+            other.fd_ = -1;
+        }
+        return *this;
+    }
+    
+    int get() const { return fd_; }
+    int release() {
+        int temp = fd_;
+        fd_ = -1;
+        return temp;
+    }
+    
+    bool is_valid() const { return fd_ != -1; }
+    
+    void reset(int new_fd = -1) {
+        if (fd_ != -1) {
+            ::close(fd_);
+        }
+        fd_ = new_fd;
+    }
+    
+private:
+    int fd_;
+};
 
 struct HttpRequest {
   std::string Method;
@@ -27,14 +82,40 @@ struct HttpRequest {
   std::string Body;
 };
 
-std::string ToLower(const std::string &Text) {
-  std::string Result = Text;
-  for (char &Character : Result) {
-    if (Character >= 'A' && Character <= 'Z') {
-      Character = static_cast<char>(Character - 'A' + 'a');
+// Security: Safer path validation
+bool IsValidFileName(const std::string& filename) {
+    if (filename.empty() || filename.size() > 255) {
+        return false;
     }
-  }
-  return Result;
+    
+    // Check for path traversal attempts
+    if (filename.find("..") != std::string::npos ||
+        filename.find('/') != std::string::npos ||
+        filename.find('\\') != std::string::npos) {
+        return false;
+    }
+    
+    // Check for dangerous characters
+    const std::string dangerous_chars = "<>:\"|?*\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F";
+    if (filename.find_first_of(dangerous_chars) != std::string::npos) {
+        return false;
+    }
+    
+    return true;
+}
+
+std::string ToLower(const std::string &text) {
+    std::string result;
+    result.reserve(text.size());
+    
+    for (unsigned char ch : text) {
+        if (ch >= 'A' && ch <= 'Z') {
+            result.push_back(static_cast<char>(ch - 'A' + 'a'));
+        } else {
+            result.push_back(static_cast<char>(ch));
+        }
+    }
+    return result;
 }
 
 bool IsRunningAsRoot() {
@@ -46,163 +127,242 @@ bool IsRunningAsRoot() {
 #endif
 }
 
-bool ReadExact(int Socket, char *Buffer, std::size_t Size) {
-  std::size_t TotalRead = 0;
+// Safe socket operations with proper error handling
+bool ReadExact(int socket_fd, char* buffer, std::size_t size) {
+    if (!buffer || size == 0) {
+        return false;
+    }
+    
+    std::size_t total_read = 0;
+    int retry_count = 0;
 
-  while (TotalRead < Size) {
-    ssize_t BytesRead = recv(Socket, Buffer + TotalRead, Size - TotalRead, 0);
+    while (total_read < size) {
+        ssize_t bytes_read = recv(socket_fd, buffer + total_read, size - total_read, 0);
 
-    if (BytesRead <= 0) {
-      return false;
+        if (bytes_read > 0) {
+            total_read += static_cast<std::size_t>(bytes_read);
+            retry_count = 0;
+        } else if (bytes_read == 0) {
+            // Connection closed
+            return false;
+        } else {
+            // Error occurred
+            if (errno == EINTR) {
+                if (++retry_count > MAX_RETRIES) {
+                    return false;
+                }
+                continue;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (++retry_count > MAX_RETRIES) {
+                    return false;
+                }
+                continue;
+            } else {
+                // Other errors
+                return false;
+            }
+        }
     }
 
-    TotalRead += static_cast<std::size_t>(BytesRead);
-  }
-
-  return true;
+    return true;
 }
 
-bool ReadHttpRequest(int Socket, std::string &OutRawRequest) {
-  std::string Request;
-  Request.reserve(4096);
+bool ReadHttpRequest(int socket_fd, std::string& out_raw_request) {
+    std::string request;
+    request.reserve(READ_BUFFER_SIZE);
 
-  char Buffer[4096];
-  bool HeadersParsed = false;
-  std::size_t ContentLength = 0;
-  std::size_t HeaderEndIndex = std::string::npos;
+    char buffer[READ_BUFFER_SIZE];
+    bool headers_parsed = false;
+    std::size_t content_length = 0;
+    std::size_t header_end_index = std::string::npos;
+    int retry_count = 0;
 
-  while (true) {
-    ssize_t BytesRead = recv(Socket, Buffer, sizeof(Buffer), 0);
+    while (true) {
+        ssize_t bytes_read = recv(socket_fd, buffer, sizeof(buffer), 0);
 
-    if (BytesRead <= 0) {
-      return false;
-    }
-
-    Request.append(Buffer, static_cast<std::size_t>(BytesRead));
-
-    if (!HeadersParsed) {
-      std::size_t Pos = Request.find("\r\n\r\n");
-      if (Pos != std::string::npos) {
-        HeaderEndIndex = Pos + 4;
-
-        std::string HeaderPart = Request.substr(0, HeaderEndIndex);
-
-        std::size_t LineEnd = HeaderPart.find("\r\n");
-        if (LineEnd == std::string::npos) {
-          return false;
+        if (bytes_read > 0) {
+            request.append(buffer, static_cast<std::size_t>(bytes_read));
+            retry_count = 0;
+        } else if (bytes_read == 0) {
+            return false; // Connection closed
+        } else {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (++retry_count > MAX_RETRIES) {
+                    return false;
+                }
+                continue;
+            }
+            return false;
         }
 
-        std::size_t HeadersStart = LineEnd + 2;
+        if (!headers_parsed) {
+            std::size_t pos = request.find("\r\n\r\n");
+            if (pos != std::string::npos) {
+                header_end_index = pos + 4;
 
-        while (HeadersStart < HeaderPart.size()) {
-          std::size_t NextEnd = HeaderPart.find("\r\n", HeadersStart);
-          if (NextEnd == std::string::npos || NextEnd == HeadersStart) {
+                std::string header_part = request.substr(0, header_end_index);
+
+                std::size_t line_end = header_part.find("\r\n");
+                if (line_end == std::string::npos) {
+                    return false;
+                }
+
+                std::size_t headers_start = line_end + 2;
+
+                while (headers_start < header_part.size()) {
+                    std::size_t next_end = header_part.find("\r\n", headers_start);
+                    if (next_end == std::string::npos || next_end == headers_start) {
+                        break;
+                    }
+
+                    std::string header_line = 
+                        header_part.substr(headers_start, next_end - headers_start);
+                    headers_start = next_end + 2;
+
+                    std::size_t colon_pos = header_line.find(':');
+                    if (colon_pos == std::string::npos) {
+                        continue;
+                    }
+
+                    std::string name = ToLower(header_line.substr(0, colon_pos));
+                    std::string value = header_line.substr(colon_pos + 1);
+
+                    // Trim whitespace
+                    std::size_t first_not_space = value.find_first_not_of(" \t");
+                    if (first_not_space != std::string::npos) {
+                        value = value.substr(first_not_space);
+                        std::size_t last_not_space = value.find_last_not_of(" \t");
+                        if (last_not_space != std::string::npos) {
+                            value = value.substr(0, last_not_space + 1);
+                        }
+                    } else {
+                        value.clear();
+                    }
+
+                    if (name == "content-length") {
+                        char* end_ptr = nullptr;
+                        unsigned long parsed_length = std::strtoul(value.c_str(), &end_ptr, 10);
+                        
+                        if (end_ptr != value.c_str() && *end_ptr == '\0') {
+                            content_length = static_cast<std::size_t>(parsed_length);
+                        } else {
+                            return false; // Invalid content-length
+                        }
+                    }
+                }
+
+                headers_parsed = true;
+
+                // DOS protection
+                if (content_length > MAX_REQUEST_SIZE) {
+                    return false;
+                }
+            }
+        }
+
+        if (headers_parsed) {
+            std::size_t body_size = request.size() - header_end_index;
+            if (body_size >= content_length) {
+                break;
+            }
+        }
+
+        // DOS protection - check total size
+        if (request.size() > MAX_REQUEST_SIZE) {
+            return false;
+        }
+    }
+
+    out_raw_request = std::move(request);
+    return true;
+}
+
+bool ParseHttpRequest(const std::string& raw_request, HttpRequest& out_request) {
+    std::size_t header_end_index = raw_request.find("\r\n\r\n");
+    if (header_end_index == std::string::npos) {
+        return false;
+    }
+
+    std::string header_part = raw_request.substr(0, header_end_index + 2);
+    std::string body_part = raw_request.substr(header_end_index + 4);
+
+    std::size_t line_end = header_part.find("\r\n");
+    if (line_end == std::string::npos) {
+        return false;
+    }
+
+    std::string request_line = header_part.substr(0, line_end);
+
+    // Parse request line more safely
+    std::istringstream line_stream(request_line);
+    if (!(line_stream >> out_request.Method >> out_request.Path >> out_request.Version)) {
+        return false;
+    }
+
+    // Security: Validate method
+    if (out_request.Method != "GET" && out_request.Method != "POST" && 
+        out_request.Method != "HEAD" && out_request.Method != "OPTIONS") {
+        return false;
+    }
+
+    // Security: Validate path length and characters
+    if (out_request.Path.empty() || out_request.Path.size() > 2048) {
+        return false;
+    }
+
+    // Remove query string
+    std::size_t query_pos = out_request.Path.find('?');
+    if (query_pos != std::string::npos) {
+        out_request.Path = out_request.Path.substr(0, query_pos);
+    }
+
+    // Security: Basic path traversal protection
+    if (out_request.Path.find("..") != std::string::npos) {
+        return false;
+    }
+
+    // Parse headers
+    std::size_t headers_start = line_end + 2;
+    while (headers_start < header_part.size()) {
+        std::size_t next_end = header_part.find("\r\n", headers_start);
+        if (next_end == std::string::npos || next_end == headers_start) {
             break;
-          }
+        }
 
-          std::string HeaderLine =
-              HeaderPart.substr(HeadersStart, NextEnd - HeadersStart);
-          HeadersStart = NextEnd + 2;
+        std::string header_line = 
+            header_part.substr(headers_start, next_end - headers_start);
+        headers_start = next_end + 2;
 
-          std::size_t ColonPos = HeaderLine.find(':');
-          if (ColonPos == std::string::npos) {
+        std::size_t colon_pos = header_line.find(':');
+        if (colon_pos == std::string::npos) {
             continue;
-          }
-
-          std::string Name = ToLower(HeaderLine.substr(0, ColonPos));
-          std::string Value = HeaderLine.substr(ColonPos + 1);
-
-          std::size_t FirstNotSpace = Value.find_first_not_of(" \t");
-          if (FirstNotSpace != std::string::npos) {
-            Value = Value.substr(FirstNotSpace);
-          }
-
-          if (Name == "content-length") {
-            ContentLength = static_cast<std::size_t>(
-                std::strtoul(Value.c_str(), nullptr, 10));
-          }
         }
 
-        HeadersParsed = true;
+        std::string name = header_line.substr(0, colon_pos);
+        std::string value = header_line.substr(colon_pos + 1);
 
-        if (ContentLength > MAX_REQUEST_SIZE) {
-          return false;
+        // Trim whitespace properly
+        std::size_t first_not_space = value.find_first_not_of(" \t");
+        if (first_not_space != std::string::npos) {
+            value = value.substr(first_not_space);
+            std::size_t last_not_space = value.find_last_not_of(" \t");
+            if (last_not_space != std::string::npos) {
+                value = value.substr(0, last_not_space + 1);
+            }
+        } else {
+            value.clear();
         }
-      }
+
+        // Limit header count for DOS protection
+        if (out_request.Headers.size() >= 50) {
+            return false;
+        }
+
+        out_request.Headers[ToLower(name)] = std::move(value);
     }
 
-    if (HeadersParsed) {
-      std::size_t BodySize = Request.size() - HeaderEndIndex;
-      if (BodySize >= ContentLength) {
-        break;
-      }
-    }
-
-    if (Request.size() > MAX_REQUEST_SIZE) {
-      return false;
-    }
-  }
-
-  OutRawRequest.swap(Request);
-  return true;
-}
-
-bool ParseHttpRequest(const std::string &RawRequest, HttpRequest &OutRequest) {
-  std::size_t HeaderEndIndex = RawRequest.find("\r\n\r\n");
-  if (HeaderEndIndex == std::string::npos) {
-    return false;
-  }
-
-  std::string HeaderPart = RawRequest.substr(0, HeaderEndIndex + 2);
-  std::string BodyPart = RawRequest.substr(HeaderEndIndex + 4);
-
-  std::size_t LineEnd = HeaderPart.find("\r\n");
-  if (LineEnd == std::string::npos) {
-    return false;
-  }
-
-  std::string RequestLine = HeaderPart.substr(0, LineEnd);
-
-  std::istringstream LineStream(RequestLine);
-  if (!(LineStream >> OutRequest.Method >> OutRequest.Path >>
-        OutRequest.Version)) {
-    return false;
-  }
-
-  std::size_t QueryPos = OutRequest.Path.find('?');
-  if (QueryPos != std::string::npos) {
-    OutRequest.Path = OutRequest.Path.substr(0, QueryPos);
-  }
-
-  std::size_t HeadersStart = LineEnd + 2;
-  while (HeadersStart < HeaderPart.size()) {
-    std::size_t NextEnd = HeaderPart.find("\r\n", HeadersStart);
-    if (NextEnd == std::string::npos || NextEnd == HeadersStart) {
-      break;
-    }
-
-    std::string HeaderLine =
-        HeaderPart.substr(HeadersStart, NextEnd - HeadersStart);
-    HeadersStart = NextEnd + 2;
-
-    std::size_t ColonPos = HeaderLine.find(':');
-    if (ColonPos == std::string::npos) {
-      continue;
-    }
-
-    std::string Name = HeaderLine.substr(0, ColonPos);
-    std::string Value = HeaderLine.substr(ColonPos + 1);
-
-    std::size_t FirstNotSpace = Value.find_first_not_of(" \t");
-    if (FirstNotSpace != std::string::npos) {
-      Value = Value.substr(FirstNotSpace);
-    }
-
-    OutRequest.Headers[ToLower(Name)] = Value;
-  }
-
-  OutRequest.Body = BodyPart;
-  return true;
+    out_request.Body = std::move(body_part);
+    return true;
 }
 
 std::string GetHeader(const HttpRequest &Request, const std::string &Name) {
@@ -213,33 +373,51 @@ std::string GetHeader(const HttpRequest &Request, const std::string &Name) {
   return std::string();
 }
 
-void SendRaw(int Socket, const std::string &Data) {
-  std::size_t TotalSent = 0;
+bool SendRaw(int socket_fd, const std::string& data) {
+    std::size_t total_sent = 0;
+    int retry_count = 0;
 
-  while (TotalSent < Data.size()) {
-    ssize_t Sent =
-        send(Socket, Data.data() + TotalSent, Data.size() - TotalSent, 0);
-    if (Sent <= 0) {
-      break;
+    while (total_sent < data.size()) {
+        ssize_t sent = send(socket_fd, data.data() + total_sent, 
+                           data.size() - total_sent, MSG_NOSIGNAL);
+        
+        if (sent > 0) {
+            total_sent += static_cast<std::size_t>(sent);
+            retry_count = 0;
+        } else if (sent == 0) {
+            return false; // Connection closed
+        } else {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (++retry_count > MAX_RETRIES) {
+                    return false;
+                }
+                continue;
+            } else if (errno == EPIPE || errno == ECONNRESET) {
+                return false; // Connection broken
+            } else {
+                return false; // Other errors
+            }
+        }
     }
-    TotalSent += static_cast<std::size_t>(Sent);
-  }
+    
+    return true;
 }
 
-void SendResponse(
-    int Socket, int StatusCode, const std::string &StatusText,
-    const std::string &Body,
-    const std::string &ContentType = "text/plain; charset=utf-8") {
-  std::ostringstream ResponseStream;
-  ResponseStream << "HTTP/1.1 " << StatusCode << " " << StatusText << "\r\n";
-  ResponseStream << "Content-Type: " << ContentType << "\r\n";
-  ResponseStream << "Content-Length: " << Body.size() << "\r\n";
-  ResponseStream << "Connection: close\r\n";
-  ResponseStream << "\r\n";
-  ResponseStream << Body;
+bool SendResponse(int socket_fd, int status_code, const std::string& status_text,
+                  const std::string& body, 
+                  const std::string& content_type = "text/plain; charset=utf-8") {
+    std::ostringstream response_stream;
+    response_stream << "HTTP/1.1 " << status_code << " " << status_text << "\r\n";
+    response_stream << "Content-Type: " << content_type << "\r\n";
+    response_stream << "Content-Length: " << body.size() << "\r\n";
+    response_stream << "Connection: close\r\n";
+    response_stream << "Server: megra-police/1.0\r\n";
+    response_stream << "X-Content-Type-Options: nosniff\r\n";
+    response_stream << "\r\n";
+    response_stream << body;
 
-  std::string Response = ResponseStream.str();
-  SendRaw(Socket, Response);
+    std::string response = response_stream.str();
+    return SendRaw(socket_fd, response);
 }
 
 std::string GetCurrentTimeString() {
@@ -394,13 +572,20 @@ bool HandleFileUpload(const HttpRequest &Request, std::string &OutMessage) {
     return false;
   }
 
-  std::size_t SlashPos = FileName.find_last_of("/\\");
-  if (SlashPos != std::string::npos) {
-    FileName = FileName.substr(SlashPos + 1);
+  // Security: Remove path components and validate filename
+  std::size_t slash_pos = FileName.find_last_of("/\\");
+  if (slash_pos != std::string::npos) {
+    FileName = FileName.substr(slash_pos + 1);
   }
 
   if (FileName.empty()) {
     FileName = "upload.bin";
+  }
+
+  // Security: Validate filename
+  if (!IsValidFileName(FileName)) {
+    OutMessage = "Invalid filename.\n";
+    return false;
   }
 
   std::size_t FileDataStart = PartHeadersEnd + 4;
@@ -426,152 +611,180 @@ bool HandleFileUpload(const HttpRequest &Request, std::string &OutMessage) {
 
   std::size_t FileSize = FileDataEnd - FileDataStart;
 
-  std::string FullPath = "/tmp/" + FileName;
+  std::string full_path = "/tmp/" + FileName;
 
-  std::ofstream Output(FullPath.c_str(), std::ios::binary);
-  if (!Output) {
+  // Security: Check file size limits
+  if (FileSize > 10 * 1024 * 1024) { // 10MB limit
+    OutMessage = "File too large (max 10MB).\n";
+    return false;
+  }
+
+  std::ofstream output(full_path, std::ios::binary | std::ios::trunc);
+  if (!output) {
     OutMessage = "Failed to open output file.\n";
     return false;
   }
 
-  Output.write(Body.data() + FileDataStart,
-               static_cast<std::streamsize>(FileSize));
-  if (!Output) {
-    OutMessage = "Failed to write all file data.\n";
+  output.write(Body.data() + FileDataStart, static_cast<std::streamsize>(FileSize));
+  if (!output.good()) {
+    OutMessage = "Failed to write file data.\n";
+    output.close();
+    // Try to remove partially written file
+    std::remove(full_path.c_str());
     return false;
   }
 
-  Output.close();
+  output.close();
+  if (!output.good()) {
+    OutMessage = "Failed to close file properly.\n";
+    std::remove(full_path.c_str());
+    return false;
+  }
 
-  std::ostringstream MessageStream;
-  MessageStream << "File uploaded successfully to " << FullPath << "\n";
-  OutMessage = MessageStream.str();
+  std::ostringstream message_stream;
+  message_stream << "File uploaded successfully to " << full_path << "\n";
+  OutMessage = message_stream.str();
   return true;
 }
 
-void HandleClient(int ClientSocket, std::vector<std::string> &Logs,
-                  const std::string &ClientIp) {
-  std::string RawRequest;
-  if (!ReadHttpRequest(ClientSocket, RawRequest)) {
-    SendResponse(ClientSocket, 400, "Bad Request",
-                 "Failed to read HTTP request.\n");
-    return;
-  }
-
-  HttpRequest Request;
-  if (!ParseHttpRequest(RawRequest, Request)) {
-    SendResponse(ClientSocket, 400, "Bad Request", "Malformed HTTP request.\n");
-    return;
-  }
-
-  int StatusCode = 500;
-  std::string StatusText = "Internal Server Error";
-  std::string ResponseBody = "Internal Server Error\n";
-  std::string ContentType = "text/plain; charset=utf-8";
-
-  if (Request.Path == "/info" && Request.Method == "GET") {
-    StatusCode = 200;
-    StatusText = "OK";
-    ResponseBody = "Все ок\n";
-  } else if (Request.Path == "/log" && Request.Method == "GET") {
-    std::ostringstream BodyStream;
-    for (const std::string &Entry : Logs) {
-      BodyStream << Entry << "\n";
+void HandleClient(Socket& client_socket, std::vector<std::string>& logs,
+                  const std::string& client_ip) {
+    std::string raw_request;
+    if (!ReadHttpRequest(client_socket.get(), raw_request)) {
+        SendResponse(client_socket.get(), 400, "Bad Request",
+                     "Failed to read HTTP request.\n");
+        return;
     }
 
-    StatusCode = 200;
-    StatusText = "OK";
-    ResponseBody = BodyStream.str();
-  } else if (Request.Path == "/upload" && Request.Method == "POST") {
-    std::string Message;
-    bool Success = HandleFileUpload(Request, Message);
+    HttpRequest request;
+    if (!ParseHttpRequest(raw_request, request)) {
+        SendResponse(client_socket.get(), 400, "Bad Request", 
+                     "Malformed HTTP request.\n");
+        return;
+    }
 
-    if (Success) {
-      StatusCode = 200;
-      StatusText = "OK";
-      ResponseBody = Message;
+    int status_code = 500;
+    std::string status_text = "Internal Server Error";
+    std::string response_body = "Internal Server Error\n";
+    std::string content_type = "text/plain; charset=utf-8";
+
+    if (request.Path == "/info" && request.Method == "GET") {
+        status_code = 200;
+        status_text = "OK";
+        response_body = "Все ок\n";
+    } else if (request.Path == "/log" && request.Method == "GET") {
+        std::ostringstream body_stream;
+        for (const std::string& entry : logs) {
+            body_stream << entry << "\n";
+        }
+
+        status_code = 200;
+        status_text = "OK";
+        response_body = body_stream.str();
+    } else if (request.Path == "/upload" && request.Method == "POST") {
+        std::string message;
+        bool success = HandleFileUpload(request, message);
+
+        if (success) {
+            status_code = 200;
+            status_text = "OK";
+            response_body = std::move(message);
+        } else {
+            status_code = 400;
+            status_text = "Bad Request";
+            response_body = std::move(message);
+        }
     } else {
-      StatusCode = 400;
-      StatusText = "Bad Request";
-      ResponseBody = Message;
+        status_code = 404;
+        status_text = "Not Found";
+        response_body = "Not Found\n";
     }
-  } else {
-    StatusCode = 404;
-    StatusText = "Not Found";
-    ResponseBody = "Not Found\n";
-  }
 
-  AddLogEntry(Logs, ClientIp, Request, StatusCode);
-  SendResponse(ClientSocket, StatusCode, StatusText, ResponseBody, ContentType);
+    AddLogEntry(logs, client_ip, request, status_code);
+    SendResponse(client_socket.get(), status_code, status_text, response_body, content_type);
 }
 
 int main() {
-  if (!IsRunningAsRoot()) {
-    std::cerr << "Эта программа должна быть запущена от root.\n";
-    return 1;
-  }
-
-  int ServerSocket = socket(AF_INET, SOCK_STREAM, 0);
-  if (ServerSocket < 0) {
-    std::cerr << "Не удалось создать сокет.\n";
-    return 1;
-  }
-
-  int OptionValue = 1;
-  if (setsockopt(ServerSocket, SOL_SOCKET, SO_REUSEADDR, &OptionValue,
-                 sizeof(OptionValue)) < 0) {
-    std::cerr << "Не удалось установить опцию SO_REUSEADDR.\n";
-    close(ServerSocket);
-    return 1;
-  }
-
-  sockaddr_in ServerAddress;
-  ServerAddress.sin_family = AF_INET;
-  ServerAddress.sin_addr.s_addr = htonl(INADDR_ANY);
-  ServerAddress.sin_port = htons(SERVER_PORT);
-
-  if (bind(ServerSocket, reinterpret_cast<sockaddr *>(&ServerAddress),
-           sizeof(ServerAddress)) < 0) {
-    std::cerr << "Не удалось выполнить bind на порт " << SERVER_PORT << ".\n";
-    close(ServerSocket);
-    return 1;
-  }
-
-  if (listen(ServerSocket, LISTEN_BACKLOG) < 0) {
-    std::cerr << "Не удалось перевести сокет в состояние прослушивания.\n";
-    close(ServerSocket);
-    return 1;
-  }
-
-  std::cout << "HTTP сервер запущен на порту " << SERVER_PORT << ".\n";
-
-  std::vector<std::string> Logs;
-
-  while (true) {
-    sockaddr_in ClientAddress;
-    socklen_t ClientAddressLength = sizeof(ClientAddress);
-
-    int ClientSocket =
-        accept(ServerSocket, reinterpret_cast<sockaddr *>(&ClientAddress),
-               &ClientAddressLength);
-    if (ClientSocket < 0) {
-      std::cerr << "Ошибка accept().\n";
-      continue;
+    // Ignore SIGPIPE to prevent crashes on broken connections
+    signal(SIGPIPE, SIG_IGN);
+    
+    if (!IsRunningAsRoot()) {
+        std::cerr << "Эта программа должна быть запущена от root.\n";
+        return 1;
     }
 
-    char AddressBuffer[INET_ADDRSTRLEN] = {0};
-    const char *AddressString = inet_ntop(AF_INET, &ClientAddress.sin_addr,
-                                          AddressBuffer, sizeof(AddressBuffer));
-    std::string ClientIp =
-        AddressString ? std::string(AddressString) : std::string("unknown");
+    Socket server_socket(socket(AF_INET, SOCK_STREAM, 0));
+    if (!server_socket.is_valid()) {
+        std::cerr << "Не удалось создать сокет: " << std::strerror(errno) << "\n";
+        return 1;
+    }
 
-    HandleClient(ClientSocket, Logs, ClientIp);
+    // Set socket options
+    int option_value = 1;
+    if (setsockopt(server_socket.get(), SOL_SOCKET, SO_REUSEADDR, 
+                   &option_value, sizeof(option_value)) < 0) {
+        std::cerr << "Не удалось установить SO_REUSEADDR: " << std::strerror(errno) << "\n";
+        return 1;
+    }
 
-    close(ClientSocket);
-  }
+    // Additional socket options for robustness
+    if (setsockopt(server_socket.get(), SOL_SOCKET, SO_REUSEPORT,
+                   &option_value, sizeof(option_value)) < 0) {
+        // SO_REUSEPORT might not be available on all systems, ignore error
+    }
 
-  close(ServerSocket);
-  return 0;
+    sockaddr_in server_address{};
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_address.sin_port = htons(SERVER_PORT);
+
+    if (bind(server_socket.get(), reinterpret_cast<sockaddr*>(&server_address),
+             sizeof(server_address)) < 0) {
+        std::cerr << "Не удалось выполнить bind на порт " << SERVER_PORT 
+                  << ": " << std::strerror(errno) << "\n";
+        return 1;
+    }
+
+    if (listen(server_socket.get(), LISTEN_BACKLOG) < 0) {
+        std::cerr << "Не удалось перевести сокет в состояние прослушивания: " 
+                  << std::strerror(errno) << "\n";
+        return 1;
+    }
+
+    std::cout << "HTTP сервер запущен на порту " << SERVER_PORT << ".\n";
+
+    std::vector<std::string> logs;
+    logs.reserve(1000); // Предварительное выделение памяти
+
+    while (true) {
+        sockaddr_in client_address{};
+        socklen_t client_address_length = sizeof(client_address);
+
+        int client_fd = accept(server_socket.get(), 
+                              reinterpret_cast<sockaddr*>(&client_address),
+                              &client_address_length);
+        if (client_fd < 0) {
+            if (errno == EINTR) {
+                continue; // Interrupted by signal, try again
+            }
+            std::cerr << "Ошибка accept(): " << std::strerror(errno) << "\n";
+            continue;
+        }
+
+        Socket client_socket(client_fd);
+
+        char address_buffer[INET_ADDRSTRLEN] = {};
+        const char* address_string = inet_ntop(AF_INET, &client_address.sin_addr,
+                                              address_buffer, sizeof(address_buffer));
+        std::string client_ip = address_string ? std::string(address_string) : 
+                                               std::string("unknown");
+
+        HandleClient(client_socket, logs, client_ip);
+        // client_socket automatically closes when going out of scope
+    }
+
+    // server_socket automatically closes when going out of scope
+    return 0;
 }
 
 #else
