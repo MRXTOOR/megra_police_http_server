@@ -278,16 +278,42 @@ bool HandleFileUpload(const HttpRequest &Request, std::string &OutMessage) {
     return false;
   }
 
-  std::size_t BoundaryPos = LowerContentType.find("boundary=");
-  if (BoundaryPos == std::string::npos) {
+  std::size_t BoundaryPosLower = LowerContentType.find("boundary=");
+  if (BoundaryPosLower == std::string::npos) {
     OutMessage = "Boundary parameter is missing in Content-Type header.\n";
     return false;
   }
 
-  std::string Boundary = LowerContentType.substr(BoundaryPos + 9);
+  std::size_t BoundaryValueStart = BoundaryPosLower + 9;
+  if (BoundaryValueStart >= ContentType.size()) {
+    OutMessage = "Boundary value is empty.\n";
+    return false;
+  }
+
+  std::string Boundary = ContentType.substr(BoundaryValueStart);
+
+  std::size_t FirstNotSpace = Boundary.find_first_not_of(" \t");
+  if (FirstNotSpace != std::string::npos) {
+    Boundary = Boundary.substr(FirstNotSpace);
+  }
+
   if (!Boundary.empty() && Boundary[0] == '"') {
     std::size_t QuoteEnd = Boundary.find('"', 1);
+    if (QuoteEnd == std::string::npos || QuoteEnd <= 1) {
+      OutMessage = "Boundary value is malformed.\n";
+      return false;
+    }
     Boundary = Boundary.substr(1, QuoteEnd - 1);
+  } else {
+    std::size_t SemicolonPos = Boundary.find(';');
+    if (SemicolonPos != std::string::npos) {
+      Boundary = Boundary.substr(0, SemicolonPos);
+    }
+  }
+
+  std::size_t LastNotSpace = Boundary.find_last_not_of(" \t");
+  if (LastNotSpace != std::string::npos) {
+    Boundary = Boundary.substr(0, LastNotSpace + 1);
   }
 
   if (Boundary.empty()) {
